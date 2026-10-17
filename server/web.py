@@ -763,9 +763,10 @@ class ServerApplication:
             return
         warnings: list[str] = []
         try:
-            self._remove_account_calendar(session_id, "delete", warnings)
-            if self.google is not None and self.database.get_google_connection(session_id) is not None:
-                self.google.disconnect(session_id)
+            if self.google is not None:
+                self._remove_account_calendar(session_id, "delete", warnings)
+                if self.database.get_google_connection(session_id) is not None:
+                    self.google.disconnect(session_id)
             self.broker.delete_profile(session_id)
             shutil.rmtree(self.config.exports_dir / session_id, ignore_errors=True)
             self.broker.forget_attempt(session_id)
@@ -852,7 +853,7 @@ class ServerApplication:
     def _api_v1_download_export(
         self, handler: BaseHTTPRequestHandler, session_id: str, filename: str
     ) -> None:
-        credential = self._api_v1_require_bearer(handler, "sessions:read")
+        credential = self._api_v1_require_bearer(handler, "events:read")
         if credential is None:
             return
         if self._api_v1_owned_session(handler, credential, session_id) is None:
@@ -1090,37 +1091,13 @@ class ServerApplication:
             fail(403, "invalid_csrf", "A valid X-CSRF-Token header is required.")
             return
 
-        content_type = (handler.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-        if content_type != "application/json":
-            fail(400, "invalid_request", "Content-Type must be application/json.")
-            return
-
         try:
-            length = int(handler.headers.get("Content-Length") or "0")
-        except ValueError:
-            fail(400, "invalid_request", "Invalid Content-Length.")
-            return
-
-        if length < 0:
-            fail(400, "invalid_request", "Invalid request body length.")
-            return
-        if length > 64 * 1024:
+            payload = self._api_v1_read_json_payload(handler)
+        except OverflowError:
             fail(413, "request_too_large", "Request body exceeds 64 KiB.")
             return
-
-        raw = handler.rfile.read(length) if length else b""
-        if len(raw) != length:
-            fail(400, "invalid_request", "Incomplete request body.")
-            return
-
-        try:
-            payload = json.loads(raw.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError):
-            fail(400, "invalid_request", "Request body must be valid JSON.")
-            return
-
-        if not isinstance(payload, dict):
-            fail(400, "invalid_request", "Request body must be a JSON object.")
+        except ValueError as error:
+            fail(400, "invalid_request", str(error))
             return
 
         name = payload.get("name", "")
@@ -1667,6 +1644,13 @@ class ServerApplication:
     def _api_v1_rate_limited(self, handler: BaseHTTPRequestHandler) -> bool:
         address = getattr(handler, "client_address", ("unknown",))
         remote_ip = str(address[0]) if address else "unknown"
+        if remote_ip in ("127.0.0.1", "::1", "localhost"):
+            forwarded = (
+                handler.headers.get("CF-Connecting-IP")
+                or handler.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+            )
+            if forwarded:
+                remote_ip = forwarded
         now = time.monotonic()
         cutoff = now - 60.0
 
@@ -1704,33 +1688,12 @@ class ServerApplication:
             return
 
         try:
-            length = int(handler.headers.get("Content-Length") or "0")
-        except ValueError:
-            fail(400, "invalid_request", "Invalid Content-Length.")
-            return
-
-        if length < 0:
-            fail(400, "invalid_request", "Invalid request body length.")
-            return
-        if length > MAX_EXPORT_FORM_BYTES:
+            payload = self._api_v1_read_json_payload(handler, max_bytes=MAX_EXPORT_FORM_BYTES)
+        except OverflowError:
             fail(413, "request_too_large", "Request body exceeds 1 MiB.")
             return
-        content_type = (handler.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-        if content_type != "application/json":
-            fail(400, "invalid_request", "Content-Type must be application/json.")
-            return
-
-        raw = handler.rfile.read(length) if length else b""
-        if len(raw) != length:
-            fail(400, "invalid_request", "Incomplete request body.")
-            return
-        try:
-            payload = json.loads(raw.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError):
-            fail(400, "invalid_request", "Request body must be valid JSON.")
-            return
-        if not isinstance(payload, dict):
-            fail(400, "invalid_request", "Request body must be a JSON object.")
+        except ValueError as error:
+            fail(400, "invalid_request", str(error))
             return
 
         format_values = query.get("format", ["json"])
@@ -1760,6 +1723,7 @@ class ServerApplication:
 
         if has_bootstrap:
             try:
+                assert isinstance(bootstrap_value, str)
                 session = parse_bootstrap_html(bootstrap_value)
             except (ValueError, UnicodeError, json.JSONDecodeError):
                 fail(400, "invalid_auth", "bootstrapHtml does not contain valid session data.")

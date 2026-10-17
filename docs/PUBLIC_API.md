@@ -9,7 +9,7 @@ All API responses are non-cacheable (`Cache-Control: no-store`).
 
 Protected endpoints use:
 
-`Authorization: Bearer <API_TOKEN>`
+`Authorization: Bearer <token>`
 
 Create a token while signed in to the web application:
 
@@ -98,7 +98,7 @@ The API only exposes sessions owned by the authenticated token owner.
   — filter events from the latest stored calendar JSON export.
 - `GET /api/v1/sessions/{sessionId}/exports` — list available stored exports.
 - `GET /api/v1/sessions/{sessionId}/exports/{filename}`
-  — download `calendar.json`, `calendar.ics`, or `calendar.xlsx`.
+  — download `calendar.json`, `calendar.ics`, or `calendar.xlsx` (`events:read`).
 - `POST /api/v1/sessions/{sessionId}/sync` — request a sync (`sync:write`).
 - `GET /api/v1/sessions/{sessionId}/sync/runs` — list recent sync runs.
 - `GET /api/v1/sessions/{sessionId}/sync/runs/{runId}` — get a sync run.

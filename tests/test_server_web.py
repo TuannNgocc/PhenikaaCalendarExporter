@@ -839,6 +839,40 @@ class WebSmokeTests(unittest.TestCase):
                 updated = json.loads(body.decode("utf-8"))["data"]["session"]
                 self.assertEqual(updated["label"], "Renamed API session")
 
+                # Seed an export file for the session
+                export_dir = _config.exports_dir / session_id
+                export_dir.mkdir(parents=True, exist_ok=True)
+                (export_dir / "calendar.json").write_text("[]", encoding="utf-8")
+
+                # Listing exports only requires sessions:read
+                status, _headers, body = self._request(
+                    server, "GET", f"/api/v1/sessions/{session_id}/exports", headers=headers
+                )
+                self.assertEqual(status, 200)
+
+                # Downloading export requires events:read; headers only has sessions:read & sessions:write
+                status, _headers, body = self._request(
+                    server, "GET", f"/api/v1/sessions/{session_id}/exports/calendar.json", headers=headers
+                )
+                self.assertEqual(status, 403)
+                self.assertEqual(json.loads(body.decode("utf-8"))["error"]["code"], "insufficient_scope")
+
+                # Deleting another user's session must return 404.
+                status, _headers, _body = self._request(
+                    server, "DELETE", f"/api/v1/sessions/{other_session}", headers=headers
+                )
+                self.assertEqual(status, 404)
+
+                # Delete the owner's session without Google OAuth configured.
+                status, _headers, body = self._request(
+                    server, "DELETE", f"/api/v1/sessions/{session_id}", headers=headers
+                )
+                self.assertEqual(status, 200)
+                del_resp = json.loads(body.decode("utf-8"))["data"]
+                self.assertEqual(del_resp["id"], session_id)
+                self.assertTrue(del_resp["deleted"])
+                self.assertIsNone(database.get_session(session_id))
+
                 # A request without a Bearer token must be rejected.
                 status, _headers, _body = self._request(
                     server, "GET", "/api/v1/sessions"
