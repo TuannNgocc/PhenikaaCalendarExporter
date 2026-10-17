@@ -136,6 +136,56 @@ class WebSmokeTests(unittest.TestCase):
             finally:
                 self._stop_app(database, server, thread)
 
+    def test_api_v1_openapi_document_is_public(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _config, database, _signed, _sync, server, thread = self._start_app(
+                directory, auth_mode="oidc"
+            )
+            try:
+                status, headers, body = self._request(
+                    server, "GET", "/api/v1/openapi.json"
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(
+                    headers["Content-Type"],
+                    "application/json; charset=utf-8",
+                )
+                self.assertEqual(headers["Cache-Control"], "no-store")
+
+                spec = json.loads(body.decode("utf-8"))
+                self.assertEqual(spec["openapi"], "3.1.0")
+                self.assertIn("/api/v1/health", spec["paths"])
+                self.assertIn("/api/v1/export/one-shot", spec["paths"])
+                self.assertIn("/api/v1/tokens", spec["paths"])
+                self.assertIn("/api/v1/sessions", spec["paths"])
+                self.assertIn(
+                    "BearerAuth",
+                    spec["components"]["securitySchemes"],
+                )
+            finally:
+                self._stop_app(database, server, thread)
+
+    def test_api_v1_health(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _config, database, _signed_sessions, _sync, server, thread = self._start_app(directory)
+            try:
+                status, headers, body = self._request(
+                    server, "GET", "/api/v1/health"
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(
+                    headers["Content-Type"],
+                    "application/json; charset=utf-8",
+                )
+                self.assertEqual(headers["Cache-Control"], "no-store")
+                data = json.loads(body.decode("utf-8"))
+                self.assertEqual(
+                    data,
+                    {"ok": True, "data": {"status": "healthy"}},
+                )
+            finally:
+                self._stop_app(database, server, thread)
+
     def test_server_status_page_and_json_api(self):
         with tempfile.TemporaryDirectory() as directory:
             _config, database, _signed_sessions, _sync, server, thread = self._start_app(directory)
@@ -158,6 +208,22 @@ class WebSmokeTests(unittest.TestCase):
                 self.assertIn("phenikaa", data["services"])
                 self.assertIn("google", data["services"])
                 self.assertNotIn("public_ip", data)
+
+                status_v1, headers_v1, body_v1 = self._request(
+                    server, "GET", "/api/v1/status"
+                )
+                self.assertEqual(status_v1, 200)
+                self.assertEqual(
+                    headers_v1["Content-Type"],
+                    "application/json; charset=utf-8",
+                )
+                self.assertEqual(headers_v1["Cache-Control"], "no-store")
+                data_v1 = json.loads(body_v1.decode("utf-8"))
+                self.assertTrue(data_v1["ok"])
+                self.assertIn("overall_status", data_v1["data"])
+                self.assertIn("services", data_v1["data"])
+                self.assertIn("system", data_v1["data"])
+                self.assertNotIn("public_ip", data_v1["data"])
 
                 status_home, _headers_home, body_home = self._request(server, "GET", "/")
                 self.assertEqual(status_home, 200)
@@ -493,6 +559,446 @@ class WebSmokeTests(unittest.TestCase):
                 self.assertEqual(status, 200)
                 self.assertEqual(captured, [{"userId": "student-id", "tokenJWT": "secret-token"}])
                 self.assertEqual(sync.requested, [])
+            finally:
+                self._stop_app(database, server, thread)
+
+    def test_api_v1_one_shot_json_export_is_ephemeral(self):
+        captured = []
+
+        def calendar_exporter(session, start, end, output_dir, prefix, calendar_name):
+            captured.append((session, start, end, calendar_name))
+            root = Path(output_dir)
+            paths = {}
+            for extension, content in (
+                ("json", b"[]"),
+                ("xlsx", b"xlsx"),
+                ("ics", b"BEGIN:VCALENDAR"),
+            ):
+                output_path = root / f"{prefix}.{extension}"
+                output_path.write_bytes(content)
+                paths[extension] = str(output_path)
+            return paths
+
+        with tempfile.TemporaryDirectory() as directory:
+            _config, database, _signed_sessions, sync, server, thread = self._start_app(
+                directory, auth_mode="oidc", calendar_exporter=calendar_exporter
+            )
+            request_body = json.dumps({
+                "userId": "student-id",
+                "tokenJWT": "test-token",
+                "start": "2026-08-01",
+                "end": "2026-10-31",
+            }).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            try:
+                status, response_headers, response_body = self._request(
+                    server,
+                    "POST",
+                    "/api/v1/export/one-shot?format=json",
+                    body=request_body,
+                    headers=headers,
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(
+                    response_headers["Content-Type"],
+                    "application/json; charset=utf-8",
+                )
+                self.assertEqual(response_headers["Cache-Control"], "no-store")
+
+                result = json.loads(response_body.decode("utf-8"))
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["data"]["events"], [])
+                self.assertEqual(
+                    captured[0][0],
+                    {"userId": "student-id", "tokenJWT": "test-token"},
+                )
+                self.assertEqual(captured[0][1].isoformat(), "2026-08-01")
+                self.assertEqual(captured[0][2].isoformat(), "2026-10-31")
+                self.assertEqual(sync.requested, [])
+                self.assertEqual(database.list_sessions(), [])
+            finally:
+                self._stop_app(database, server, thread)
+
+    def test_api_v1_one_shot_rejects_body_over_one_mib(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _config, database, _signed_sessions, _sync, server, thread = self._start_app(
+                directory, auth_mode="oidc"
+            )
+            try:
+                status, headers, body = self._request(
+                    server,
+                    "POST",
+                    "/api/v1/export/one-shot",
+                    body=b"",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Content-Length": str(1024 * 1024 + 1),
+                    },
+                )
+                self.assertEqual(status, 413)
+                self.assertEqual(headers["Cache-Control"], "no-store")
+                result = json.loads(body.decode("utf-8"))
+                self.assertFalse(result["ok"])
+                self.assertEqual(
+                    result["error"]["code"],
+                    "request_too_large",
+                )
+            finally:
+                self._stop_app(database, server, thread)
+
+    def test_api_v1_one_shot_rate_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _config, database, _signed_sessions, _sync, server, thread = self._start_app(
+                directory, auth_mode="oidc"
+            )
+            body = json.dumps({
+                "start": "2026-08-01",
+                "end": "2026-10-31",
+            }).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            try:
+                for _ in range(10):
+                    status, _headers, _response = self._request(
+                        server,
+                        "POST",
+                        "/api/v1/export/one-shot",
+                        body=body,
+                        headers=headers,
+                    )
+                    self.assertEqual(status, 400)
+
+                status, response_headers, response_body = self._request(
+                    server,
+                    "POST",
+                    "/api/v1/export/one-shot",
+                    body=body,
+                    headers=headers,
+                )
+                self.assertEqual(status, 429)
+                self.assertEqual(
+                    response_headers["Cache-Control"],
+                    "no-store",
+                )
+                result = json.loads(response_body.decode("utf-8"))
+                self.assertFalse(result["ok"])
+                self.assertEqual(
+                    result["error"]["code"],
+                    "rate_limited",
+                )
+            finally:
+                self._stop_app(database, server, thread)
+
+    def test_api_v1_one_shot_file_formats(self):
+        def calendar_exporter(session, start, end, output_dir, prefix, calendar_name):
+            root = Path(output_dir)
+            paths = {}
+            for extension, content in (
+                ("json", b"[]"),
+                ("xlsx", b"test-xlsx-content"),
+                ("ics", b"BEGIN:VCALENDAR\\r\\nEND:VCALENDAR\\r\\n"),
+            ):
+                output_path = root / f"{prefix}.{extension}"
+                output_path.write_bytes(content)
+                paths[extension] = str(output_path)
+            return paths
+
+        expected_types = {
+            "ics": "text/calendar; charset=utf-8",
+            "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "zip": "application/zip",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            _config, database, _signed_sessions, _sync, server, thread = self._start_app(
+                directory, auth_mode="oidc", calendar_exporter=calendar_exporter
+            )
+            payload = json.dumps({
+                "userId": "student-id",
+                "tokenJWT": "test-token",
+                "start": "2026-08-01",
+                "end": "2026-10-31",
+            }).encode("utf-8")
+            try:
+                for output_format, expected_type in expected_types.items():
+                    with self.subTest(format=output_format):
+                        status, headers, body = self._request(
+                            server,
+                            "POST",
+                            f"/api/v1/export/one-shot?format={output_format}",
+                            body=payload,
+                            headers={"Content-Type": "application/json"},
+                        )
+                        self.assertEqual(status, 200)
+                        self.assertEqual(headers["Content-Type"], expected_type)
+                        self.assertEqual(headers["Cache-Control"], "no-store")
+                        self.assertIn("attachment;", headers["Content-Disposition"])
+
+                        if output_format == "ics":
+                            self.assertIn(b"BEGIN:VCALENDAR", body)
+                        elif output_format == "xlsx":
+                            self.assertEqual(body, b"test-xlsx-content")
+                        else:
+                            with zipfile.ZipFile(io.BytesIO(body)) as archive:
+                                self.assertEqual(
+                                    sorted(archive.namelist()),
+                                    ["calendar.ics", "calendar.json", "calendar.xlsx"],
+                                )
+            finally:
+                self._stop_app(database, server, thread)
+
+    def test_api_v1_sessions_crud_and_owner_isolation(self):
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as directory:
+            _config, database, _signed, _sync, server, thread = self._start_app(
+                directory, auth_mode="oidc"
+            )
+            try:
+                owner = database.get_or_create_user("api-session-owner", "Owner")
+                other = database.get_or_create_user("api-session-other", "Other")
+                other_session = database.create_session(
+                    int(other["id"]), label="Private session"
+                )
+
+                secret = "phk_test_sessions_secret_123456"
+                database.create_api_token(
+                    token_id="api-sessions-test-token",
+                    owner_user_id=int(owner["id"]),
+                    token_hash=hashlib.sha256(secret.encode("utf-8")).hexdigest(),
+                    token_prefix=secret[:12],
+                    scopes=["sessions:read", "sessions:write"],
+                    name="session integration test",
+                )
+                headers = {"Authorization": f"Bearer {secret}"}
+
+                # The owner initially has no sessions.
+                status, _headers, body = self._request(
+                    server, "GET", "/api/v1/sessions", headers=headers
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(
+                    json.loads(body.decode("utf-8"))["data"]["sessions"], []
+                )
+
+                # Create a session using the Bearer token.
+                payload = {
+                    "label": "API-created session",
+                    "rangeStart": "2026-09-01",
+                    "rangeEnd": "2027-01-31",
+                    "syncIntervalHours": 24,
+                }
+                status, _headers, body = self._request(
+                    server,
+                    "POST",
+                    "/api/v1/sessions",
+                    body=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        **headers,
+                        "Content-Type": "application/json",
+                    },
+                )
+                self.assertEqual(status, 201)
+                created = json.loads(body.decode("utf-8"))["data"]["session"]
+                session_id = created["id"]
+                self.assertEqual(created["label"], "API-created session")
+
+                # Listing and reading return only sessions owned by the token owner.
+                status, _headers, body = self._request(
+                    server, "GET", "/api/v1/sessions", headers=headers
+                )
+                self.assertEqual(status, 200)
+                sessions = json.loads(body.decode("utf-8"))["data"]["sessions"]
+                self.assertEqual([item["id"] for item in sessions], [session_id])
+                self.assertNotIn(other_session, [item["id"] for item in sessions])
+
+                status, _headers, body = self._request(
+                    server, "GET", f"/api/v1/sessions/{session_id}", headers=headers
+                )
+                self.assertEqual(status, 200)
+                detail = json.loads(body.decode("utf-8"))["data"]["session"]
+                self.assertEqual(detail["id"], session_id)
+
+                status, _headers, body = self._request(
+                    server, "GET", f"/api/v1/sessions/{other_session}", headers=headers
+                )
+                self.assertEqual(status, 404)
+
+                # Update only the owner's session.
+                updated_payload = {"label": "Renamed API session"}
+                status, _headers, body = self._request(
+                    server,
+                    "PATCH",
+                    f"/api/v1/sessions/{session_id}",
+                    body=json.dumps(updated_payload).encode("utf-8"),
+                    headers={
+                        **headers,
+                        "Content-Type": "application/json",
+                    },
+                )
+                self.assertEqual(status, 200)
+                updated = json.loads(body.decode("utf-8"))["data"]["session"]
+                self.assertEqual(updated["label"], "Renamed API session")
+
+                # A request without a Bearer token must be rejected.
+                status, _headers, _body = self._request(
+                    server, "GET", "/api/v1/sessions"
+                )
+                self.assertEqual(status, 401)
+            finally:
+                self._stop_app(database, server, thread)
+
+    def test_api_v1_token_create_bearer_me_list_and_revoke(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                _config,
+                database,
+                signed_sessions,
+                _sync,
+                server,
+                thread,
+            ) = self._start_app(directory, auth_mode="oidc")
+
+            cookie = self._app_cookie(
+                signed_sessions,
+                subject="api-token-owner",
+                name="API Token Owner",
+                csrf="test-csrf",
+            )
+            browser_headers = {
+                "Content-Type": "application/json",
+                "Cookie": f"phenikaa_server_session={cookie}",
+                "X-CSRF-Token": "test-csrf",
+            }
+
+            try:
+                # Create a token using the logged-in browser session and CSRF.
+                status, headers, body = self._request(
+                    server,
+                    "POST",
+                    "/api/v1/tokens",
+                    body=json.dumps({
+                        "name": "test integration token",
+                        "scopes": ["me:read", "tokens:read", "tokens:write"],
+                    }).encode("utf-8"),
+                    headers=browser_headers,
+                )
+                self.assertEqual(status, 201)
+                self.assertEqual(
+                    headers["Content-Type"],
+                    "application/json; charset=utf-8",
+                )
+                self.assertEqual(headers["Cache-Control"], "no-store")
+
+                created = json.loads(body.decode("utf-8"))["data"]
+                secret = created["token"]
+                token_id = created["id"]
+                self.assertTrue(secret.startswith("phk_"))
+
+                # Ensure the listed database record does not expose the secret.
+                user = database.find_user("api-token-owner")
+                self.assertIsNotNone(user)
+                records = database.list_api_tokens(int(user["id"]))
+                self.assertEqual(len(records), 1)
+                self.assertNotIn(secret, repr(records))
+
+                bearer_headers = {"Authorization": f"Bearer {secret}"}
+
+                # The new token identifies its owner.
+                status, _headers, body = self._request(
+                    server, "GET", "/api/v1/me", headers=bearer_headers
+                )
+                self.assertEqual(status, 200)
+                me_data = json.loads(body.decode("utf-8"))["data"]
+                self.assertEqual(me_data["token"]["id"], token_id)
+                self.assertIn("me:read", me_data["scopes"])
+
+                # The owner can list their tokens using the appropriate scope.
+                status, _headers, body = self._request(
+                    server, "GET", "/api/v1/tokens", headers=bearer_headers
+                )
+                self.assertEqual(status, 200)
+                listed = json.loads(body.decode("utf-8"))["data"]["tokens"]
+                self.assertEqual(len(listed), 1)
+                self.assertEqual(listed[0]["id"], token_id)
+
+                # Revoke the token, then confirm it can no longer authenticate.
+                status, _headers, body = self._request(
+                    server,
+                    "POST",
+                    f"/api/v1/tokens/{token_id}/revoke",
+                    headers=bearer_headers,
+                )
+                self.assertEqual(status, 200)
+                self.assertTrue(
+                    json.loads(body.decode("utf-8"))["data"]["revoked"]
+                )
+
+                status, _headers, body = self._request(
+                    server, "GET", "/api/v1/me", headers=bearer_headers
+                )
+                self.assertEqual(status, 401)
+                error = json.loads(body.decode("utf-8"))["error"]
+                self.assertEqual(error["code"], "invalid_auth")
+            finally:
+                self._stop_app(database, server, thread)
+
+    def test_api_v1_one_shot_rejects_invalid_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _config, database, _signed_sessions, _sync, server, thread = self._start_app(
+                directory, auth_mode="oidc"
+            )
+            cases = [
+                (
+                    "invalid_range",
+                    {
+                        "userId": "student-id",
+                        "tokenJWT": "test-token",
+                        "start": "2026-10-31",
+                        "end": "2026-08-01",
+                    },
+                    "/api/v1/export/one-shot?format=json",
+                ),
+                (
+                    "invalid_auth",
+                    {
+                        "start": "2026-08-01",
+                        "end": "2026-10-31",
+                    },
+                    "/api/v1/export/one-shot?format=json",
+                ),
+                (
+                    "invalid_format",
+                    {
+                        "userId": "student-id",
+                        "tokenJWT": "test-token",
+                        "start": "2026-08-01",
+                        "end": "2026-10-31",
+                    },
+                    "/api/v1/export/one-shot?format=pdf",
+                ),
+            ]
+            try:
+                for expected_code, payload, url in cases:
+                    with self.subTest(error=expected_code):
+                        status, headers, body = self._request(
+                            server,
+                            "POST",
+                            url,
+                            body=json.dumps(payload).encode("utf-8"),
+                            headers={"Content-Type": "application/json"},
+                        )
+                        self.assertEqual(status, 400)
+                        self.assertEqual(
+                            headers["Content-Type"],
+                            "application/json; charset=utf-8",
+                        )
+                        self.assertEqual(headers["Cache-Control"], "no-store")
+                        result = json.loads(body.decode("utf-8"))
+                        self.assertFalse(result["ok"])
+                        self.assertEqual(
+                            result["error"]["code"],
+                            expected_code,
+                        )
             finally:
                 self._stop_app(database, server, thread)
 

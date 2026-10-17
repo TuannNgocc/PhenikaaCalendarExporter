@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import html
 import io
 import json
+import math
 import secrets
 import shutil
 import tempfile
+import threading
+import time
 import urllib.parse
 import zipfile
 from datetime import date, datetime
@@ -20,6 +24,7 @@ from phenikaa_exporter import export_calendar_files, parse_bootstrap_html
 from phenikaa_login import LoginTimeout
 
 from server.config import ServerConfig, academic_year_range
+from server.api_v1 import err as api_err, ok as api_ok, parse_date, openapi_document
 from server.crypto import TokenVault, token_fingerprint
 from server.db import (
     Database,
@@ -105,6 +110,8 @@ class ServerApplication:
         self.calendar_exporter = calendar_exporter
         self.profile_lock_timeout = profile_lock_timeout
         self.status_collector = status_collector or StatusCollector()
+        self._api_v1_rate_lock = threading.Lock()
+        self._api_v1_request_times: dict[str, list[float]] = {}
 
     def handler(self) -> type[BaseHTTPRequestHandler]:
         application = self
@@ -121,13 +128,78 @@ class ServerApplication:
             def do_POST(self) -> None:
                 application.handle_post(self)
 
+            def do_PATCH(self) -> None:
+                application.handle_api_v1_patch(self)
+
+            def do_DELETE(self) -> None:
+                application.handle_api_v1_delete(self)
+
         return Handler
 
     def handle_get(self, handler: BaseHTTPRequestHandler) -> None:
         parsed = urllib.parse.urlsplit(handler.path)
         path = parsed.path
+        if path == "/api/v1/openapi.json":
+            self._json(
+                handler,
+                200,
+                openapi_document(),
+                content_type="application/json; charset=utf-8",
+            )
+            return
+        if path == "/api/v1/health":
+            self._json(
+                handler,
+                200,
+                api_ok({"status": "healthy"}),
+                content_type="application/json; charset=utf-8",
+            )
+            return
         if path == "/healthz":
             self._json(handler, 200, {"ok": True})
+            return
+        if path == "/api/v1/status":
+            refresh = "refresh" in urllib.parse.parse_qs(parsed.query)
+            self._json(
+                handler,
+                200,
+                api_ok(self._get_system_status(refresh=refresh)),
+                content_type="application/json; charset=utf-8",
+            )
+            return
+        if path == "/api/v1/me":
+            self._api_v1_me(handler)
+            return
+        if path == "/api/v1/tokens":
+            self._api_v1_list_tokens(handler)
+            return
+        if path == "/api/v1/sessions":
+            self._api_v1_list_sessions(handler)
+            return
+        api_parts = [part for part in path.split("/") if part]
+        if len(api_parts) >= 4 and api_parts[:3] == ["api", "v1", "sessions"]:
+            sid = api_parts[3]
+            if len(api_parts) == 4:
+                self._api_v1_get_session(handler, sid)
+                return
+            if len(api_parts) == 5 and api_parts[4] == "events":
+                self._api_v1_session_events(
+                    handler, sid, urllib.parse.parse_qs(parsed.query)
+                )
+                return
+            if len(api_parts) == 5 and api_parts[4] == "exports":
+                self._api_v1_list_exports(handler, sid)
+                return
+            if len(api_parts) == 6 and api_parts[4] == "exports":
+                self._api_v1_download_export(handler, sid, api_parts[5])
+                return
+            if len(api_parts) == 6 and api_parts[4:6] == ["sync", "runs"]:
+                self._api_v1_list_sync_runs(handler, sid)
+                return
+            if len(api_parts) == 7 and api_parts[4:6] == ["sync", "runs"]:
+                self._api_v1_get_sync_run(handler, sid, api_parts[6])
+                return
+            self._api_v1_error_response(handler, 404, "not_found", "API route not found.")
             return
         if path in ("/api/status", "/status.json"):
             refresh = "refresh" in urllib.parse.parse_qs(parsed.query)
@@ -221,7 +293,33 @@ class ServerApplication:
         self._error(handler, 404, "not found")
 
     def handle_post(self, handler: BaseHTTPRequestHandler) -> None:
-        path = urllib.parse.urlsplit(handler.path).path
+        parsed = urllib.parse.urlsplit(handler.path)
+        path = parsed.path
+        if path == "/api/v1/tokens":
+            self._api_v1_create_token(handler)
+            return
+        token_parts = [part for part in path.split("/") if part]
+        if (
+            len(token_parts) == 5
+            and token_parts[:3] == ["api", "v1", "tokens"]
+            and token_parts[4] == "revoke"
+        ):
+            self._api_v1_revoke_token(handler, token_parts[3])
+            return
+        if path == "/api/v1/sessions":
+            self._api_v1_create_session(handler)
+            return
+        api_post_parts = [part for part in path.split("/") if part]
+        if (
+            len(api_post_parts) == 5
+            and api_post_parts[:3] == ["api", "v1", "sessions"]
+            and api_post_parts[4] == "sync"
+        ):
+            self._api_v1_sync_session(handler, api_post_parts[3])
+            return
+        if path == "/api/v1/export/one-shot":
+            self._api_v1_one_shot(handler, urllib.parse.parse_qs(parsed.query))
+            return
         identity = self._identity(handler)
         if identity is None and path != "/export":
             self._error(handler, 401, "authentication required")
@@ -438,6 +536,683 @@ class ServerApplication:
             self._redirect(handler, "/")
             return
         self._error(handler, 404, "not found")
+
+    def _api_v1_error_response(
+        self, handler: BaseHTTPRequestHandler, status: int, code: str, message: str
+    ) -> None:
+        self._json(
+            handler,
+            status,
+            api_err(code, message),
+            content_type="application/json; charset=utf-8",
+        )
+
+    def _api_v1_read_json_payload(
+        self, handler: BaseHTTPRequestHandler, *, max_bytes: int = 64 * 1024
+    ) -> dict[str, Any]:
+        content_type = (handler.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise ValueError("Content-Type must be application/json.")
+        try:
+            length = int(handler.headers.get("Content-Length") or "0")
+        except ValueError as error:
+            raise ValueError("invalid Content-Length") from error
+        if length < 0:
+            raise ValueError("invalid request length")
+        if length > max_bytes:
+            raise OverflowError("request body is too large")
+        raw = handler.rfile.read(length) if length else b""
+        if len(raw) != length:
+            raise ValueError("incomplete request body")
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError("request body must be valid JSON") from error
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        return payload
+
+    @staticmethod
+    def _api_v1_session_summary(session: dict[str, Any]) -> dict[str, Any]:
+        fields = (
+            "id", "label", "status", "range_start", "range_end",
+            "sync_interval_hours", "last_sync_at", "last_sync_status",
+            "created_at", "updated_at",
+        )
+        return {key: session.get(key) for key in fields}
+
+    def _api_v1_owned_session(
+        self,
+        handler: BaseHTTPRequestHandler,
+        credential: dict[str, Any],
+        session_id: str,
+    ) -> dict[str, Any] | None:
+        session = self.database.get_session(session_id)
+        if session is None or int(session["owner_user_id"]) != int(credential["owner_user_id"]):
+            self._api_v1_error_response(handler, 404, "not_found", "Session not found.")
+            return None
+        return session
+
+    def _api_v1_list_sessions(self, handler: BaseHTTPRequestHandler) -> None:
+        credential = self._api_v1_require_bearer(handler, "sessions:read")
+        if credential is None:
+            return
+        sessions = self.database.list_sessions(int(credential["owner_user_id"]))
+        self._json(
+            handler, 200,
+            api_ok({"sessions": [self._api_v1_session_summary(item) for item in sessions]}),
+            content_type="application/json; charset=utf-8",
+        )
+
+    def _api_v1_create_session(self, handler: BaseHTTPRequestHandler) -> None:
+        credential = self._api_v1_require_bearer(handler, "sessions:write")
+        if credential is None:
+            return
+        try:
+            payload = self._api_v1_read_json_payload(handler)
+        except OverflowError:
+            self._api_v1_error_response(handler, 413, "request_too_large", "Request body exceeds 64 KiB.")
+            return
+        except ValueError as error:
+            self._api_v1_error_response(handler, 400, "invalid_request", str(error))
+            return
+
+        label = payload.get("label", "Phenikaa account")
+        if not isinstance(label, str) or len(label) > 80:
+            self._api_v1_error_response(handler, 400, "invalid_request", "label must be a string of at most 80 characters.")
+            return
+
+        default_start, default_end = academic_year_range()
+        try:
+            start = parse_date(payload.get("rangeStart", default_start.isoformat()))
+            end = parse_date(payload.get("rangeEnd", default_end.isoformat()))
+            if start > end:
+                raise ValueError("start date must not be after end date")
+        except ValueError:
+            self._api_v1_error_response(handler, 400, "invalid_range", "Provide a valid rangeStart and rangeEnd.")
+            return
+
+        interval_value = payload.get("syncIntervalHours", self.config.sync_interval_hours)
+        if isinstance(interval_value, bool) or not isinstance(interval_value, (int, float)):
+            self._api_v1_error_response(handler, 400, "invalid_request", "syncIntervalHours must be a number.")
+            return
+        interval = float(interval_value)
+        if not math.isfinite(interval) or not 0.25 <= interval <= 720:
+            self._api_v1_error_response(handler, 400, "invalid_request", "syncIntervalHours must be between 0.25 and 720.")
+            return
+
+        try:
+            session_id = self.database.create_session(
+                int(credential["owner_user_id"]),
+                label=label.strip() or "Phenikaa account",
+                range_start=start.isoformat(),
+                range_end=end.isoformat(),
+                sync_interval_hours=interval,
+            )
+        except OwnerSessionExistsError:
+            self._api_v1_error_response(handler, 409, "session_exists", "This account already has a Phenikaa session.")
+            return
+
+        session = self.database.get_session(session_id)
+        self._json(
+            handler, 201,
+            api_ok({"session": self._api_v1_session_summary(session or {"id": session_id})}),
+            content_type="application/json; charset=utf-8",
+        )
+
+    def _api_v1_get_session(
+        self, handler: BaseHTTPRequestHandler, session_id: str
+    ) -> None:
+        credential = self._api_v1_require_bearer(handler, "sessions:read")
+        if credential is None:
+            return
+        session = self._api_v1_owned_session(handler, credential, session_id)
+        if session is None:
+            return
+        self._json(
+            handler, 200,
+            api_ok({
+                "session": self._api_v1_session_summary(session),
+                "lastSyncRuns": self.database.last_sync_runs(session_id, limit=1),
+            }),
+            content_type="application/json; charset=utf-8",
+        )
+
+    def _api_v1_patch_session(
+        self, handler: BaseHTTPRequestHandler, session_id: str
+    ) -> None:
+        credential = self._api_v1_require_bearer(handler, "sessions:write")
+        if credential is None:
+            return
+        session = self._api_v1_owned_session(handler, credential, session_id)
+        if session is None:
+            return
+        try:
+            payload = self._api_v1_read_json_payload(handler)
+        except OverflowError:
+            self._api_v1_error_response(handler, 413, "request_too_large", "Request body exceeds 64 KiB.")
+            return
+        except ValueError as error:
+            self._api_v1_error_response(handler, 400, "invalid_request", str(error))
+            return
+
+        allowed = {"label", "rangeStart", "rangeEnd", "syncIntervalHours"}
+        if not payload or set(payload) - allowed:
+            self._api_v1_error_response(handler, 400, "invalid_request", "Provide one or more supported session fields.")
+            return
+
+        label = None
+        if "label" in payload:
+            label_value = payload["label"]
+            if not isinstance(label_value, str) or len(label_value) > 80:
+                self._api_v1_error_response(handler, 400, "invalid_request", "label must be a string of at most 80 characters.")
+                return
+            label = label_value.strip() or "Phenikaa account"
+
+        start = end = None
+        if "rangeStart" in payload or "rangeEnd" in payload:
+            try:
+                start = parse_date(payload.get("rangeStart", session.get("range_start")))
+                end = parse_date(payload.get("rangeEnd", session.get("range_end")))
+                if start > end:
+                    raise ValueError("start date must not be after end date")
+            except ValueError:
+                self._api_v1_error_response(handler, 400, "invalid_range", "Provide a valid rangeStart and rangeEnd.")
+                return
+
+        interval = None
+        if "syncIntervalHours" in payload:
+            value = payload["syncIntervalHours"]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                self._api_v1_error_response(handler, 400, "invalid_request", "syncIntervalHours must be a number.")
+                return
+            interval = float(value)
+            if not math.isfinite(interval) or not 0.25 <= interval <= 720:
+                self._api_v1_error_response(handler, 400, "invalid_request", "syncIntervalHours must be between 0.25 and 720.")
+                return
+
+        self.database.update_session_api_fields(
+            session_id,
+            label=label,
+            range_start=start.isoformat() if start else None,
+            range_end=end.isoformat() if end else None,
+            sync_interval_hours=interval,
+        )
+        updated = self.database.get_session(session_id)
+        self._json(
+            handler, 200,
+            api_ok({"session": self._api_v1_session_summary(updated or session)}),
+            content_type="application/json; charset=utf-8",
+        )
+
+    def _api_v1_delete_session(
+        self, handler: BaseHTTPRequestHandler, session_id: str
+    ) -> None:
+        credential = self._api_v1_require_bearer(handler, "sessions:write")
+        if credential is None:
+            return
+        session = self._api_v1_owned_session(handler, credential, session_id)
+        if session is None:
+            return
+
+        self.broker.forget_attempt(session_id)
+        self.database.update_session_status(session_id, STATUS_DISABLED)
+        lock = self._acquire_profile_lock(session_id)
+        if lock is None:
+            self._api_v1_error_response(handler, 409, "conflict_running", "Session profile is busy; retry shortly.")
+            return
+        warnings: list[str] = []
+        try:
+            self._remove_account_calendar(session_id, "delete", warnings)
+            if self.google is not None and self.database.get_google_connection(session_id) is not None:
+                self.google.disconnect(session_id)
+            self.broker.delete_profile(session_id)
+            shutil.rmtree(self.config.exports_dir / session_id, ignore_errors=True)
+            self.broker.forget_attempt(session_id)
+            self.database.delete_session(session_id)
+        except Exception:
+            self._api_v1_error_response(handler, 502, "delete_failed", "Session cleanup failed; retry or check Google Calendar.")
+            return
+        finally:
+            lock.release()
+        self._json(
+            handler, 200,
+            api_ok({"id": session_id, "deleted": True, "cleanupWarnings": len(warnings)}),
+            content_type="application/json; charset=utf-8",
+        )
+
+    def _api_v1_session_events(
+        self, handler: BaseHTTPRequestHandler, session_id: str, query: dict[str, list[str]]
+    ) -> None:
+        credential = self._api_v1_require_bearer(handler, "events:read")
+        if credential is None:
+            return
+        session = self._api_v1_owned_session(handler, credential, session_id)
+        if session is None:
+            return
+        try:
+            start = parse_date((query.get("start") or [""])[0])
+            end = parse_date((query.get("end") or [""])[0])
+            if start > end:
+                raise ValueError("invalid range")
+        except ValueError:
+            self._api_v1_error_response(handler, 400, "invalid_range", "Provide start and end dates.")
+            return
+
+        path = self.config.exports_dir / session_id / "calendar.json"
+        if not path.is_file():
+            self._api_v1_error_response(handler, 404, "not_found", "Calendar export is not available.")
+            return
+        try:
+            events = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(events, list):
+                raise ValueError("calendar payload is not a list")
+        except (OSError, ValueError, json.JSONDecodeError):
+            self._api_v1_error_response(handler, 502, "export_unavailable", "Stored calendar data could not be read.")
+            return
+
+        filtered = []
+        for event in events:
+            try:
+                event_date = parse_date(str(event.get("NGAYHOC") or ""))
+            except ValueError:
+                continue
+            if start <= event_date <= end:
+                filtered.append(event)
+        self._json(
+            handler, 200, api_ok({"events": filtered}),
+            content_type="application/json; charset=utf-8",
+        )
+
+    def _api_v1_list_exports(
+        self, handler: BaseHTTPRequestHandler, session_id: str
+    ) -> None:
+        credential = self._api_v1_require_bearer(handler, "sessions:read")
+        if credential is None:
+            return
+        if self._api_v1_owned_session(handler, credential, session_id) is None:
+            return
+
+        root = self.config.exports_dir / session_id
+        exports = []
+        for extension in ("json", "ics", "xlsx"):
+            file_path = root / f"calendar.{extension}"
+            if file_path.is_file():
+                stat = file_path.stat()
+                exports.append({
+                    "format": extension,
+                    "bytes": stat.st_size,
+                    "updatedAt": datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(),
+                })
+        self._json(
+            handler, 200, api_ok({"exports": exports}),
+            content_type="application/json; charset=utf-8",
+        )
+
+    def _api_v1_download_export(
+        self, handler: BaseHTTPRequestHandler, session_id: str, filename: str
+    ) -> None:
+        credential = self._api_v1_require_bearer(handler, "sessions:read")
+        if credential is None:
+            return
+        if self._api_v1_owned_session(handler, credential, session_id) is None:
+            return
+        allowed = {
+            "calendar.json": "application/json; charset=utf-8",
+            "calendar.ics": "text/calendar; charset=utf-8",
+            "calendar.xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }
+        content_type = allowed.get(filename)
+        if content_type is None:
+            self._api_v1_error_response(handler, 404, "not_found", "Export not found.")
+            return
+        file_path = self.config.exports_dir / session_id / filename
+        if not file_path.is_file():
+            self._api_v1_error_response(handler, 404, "not_found", "Export is not available.")
+            return
+        body = file_path.read_bytes()
+        handler.send_response(200)
+        handler.send_header("Content-Type", content_type)
+        handler.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    @staticmethod
+    def _api_v1_run_summary(run: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "runId": run["id"],
+            "status": "running" if run.get("finished_at") is None else ("succeeded" if run.get("ok") else "failed"),
+            "startedAt": run.get("started_at"),
+            "finishedAt": run.get("finished_at"),
+            "events": run.get("events"),
+            "refreshedToken": bool(run.get("refreshed_token")),
+            "detail": run.get("detail"),
+        }
+
+    def _api_v1_sync_session(
+        self, handler: BaseHTTPRequestHandler, session_id: str
+    ) -> None:
+        credential = self._api_v1_require_bearer(handler, "sync:write")
+        if credential is None:
+            return
+        if self._api_v1_owned_session(handler, credential, session_id) is None:
+            return
+        before = {item["id"] for item in self.database.last_sync_runs(session_id, limit=20)}
+        try:
+            self.sync_engine.request_sync(session_id)
+        except Exception:
+            self._api_v1_error_response(handler, 409, "conflict_running", "Sync could not be queued.")
+            return
+        runs = self.database.last_sync_runs(session_id, limit=20)
+        created = next((item for item in runs if item["id"] not in before), None)
+        self._json(
+            handler, 202,
+            api_ok({
+                "runId": created["id"] if created else None,
+                "status": self._api_v1_run_summary(created)["status"] if created else "queued",
+            }),
+            content_type="application/json; charset=utf-8",
+        )
+
+    def _api_v1_list_sync_runs(
+        self, handler: BaseHTTPRequestHandler, session_id: str
+    ) -> None:
+        credential = self._api_v1_require_bearer(handler, "sessions:read")
+        if credential is None:
+            return
+        if self._api_v1_owned_session(handler, credential, session_id) is None:
+            return
+        runs = self.database.last_sync_runs(session_id, limit=50)
+        self._json(
+            handler, 200,
+            api_ok({"runs": [self._api_v1_run_summary(item) for item in runs]}),
+            content_type="application/json; charset=utf-8",
+        )
+
+    def _api_v1_get_sync_run(
+        self, handler: BaseHTTPRequestHandler, session_id: str, run_id: str
+    ) -> None:
+        credential = self._api_v1_require_bearer(handler, "sessions:read")
+        if credential is None:
+            return
+        if self._api_v1_owned_session(handler, credential, session_id) is None:
+            return
+        try:
+            numeric_id = int(run_id)
+        except ValueError:
+            self._api_v1_error_response(handler, 404, "not_found", "Sync run not found.")
+            return
+        run = self.database.get_sync_run(session_id, numeric_id)
+        if run is None:
+            self._api_v1_error_response(handler, 404, "not_found", "Sync run not found.")
+            return
+        self._json(
+            handler, 200, api_ok({"run": self._api_v1_run_summary(run)}),
+            content_type="application/json; charset=utf-8",
+        )
+
+    def handle_api_v1_patch(self, handler: BaseHTTPRequestHandler) -> None:
+        parts = [part for part in urllib.parse.urlsplit(handler.path).path.split("/") if part]
+        if len(parts) == 4 and parts[:3] == ["api", "v1", "sessions"]:
+            self._api_v1_patch_session(handler, parts[3])
+            return
+        self._api_v1_error_response(handler, 404, "not_found", "API route not found.")
+
+    def handle_api_v1_delete(self, handler: BaseHTTPRequestHandler) -> None:
+        parts = [part for part in urllib.parse.urlsplit(handler.path).path.split("/") if part]
+        if len(parts) == 4 and parts[:3] == ["api", "v1", "sessions"]:
+            self._api_v1_delete_session(handler, parts[3])
+            return
+        self._api_v1_error_response(handler, 404, "not_found", "API route not found.")
+
+    def _api_v1_authenticate_bearer(
+        self, handler: BaseHTTPRequestHandler
+    ) -> dict[str, Any] | None:
+        """Verify a revocable API token without storing or comparing it in plain text."""
+        authorization = handler.headers.get("Authorization", "")
+        scheme, separator, supplied = authorization.partition(" ")
+        if not separator or scheme.lower() != "bearer":
+            return None
+
+        token = supplied.strip()
+        if not token or any(character.isspace() for character in token):
+            return None
+
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        candidates = self.database.get_api_token_candidates(token[:12])
+
+        for row in candidates:
+            stored_hash = str(row.get("token_hash") or "")
+            if not secrets.compare_digest(stored_hash, token_hash):
+                continue
+
+            token_id = str(row["id"])
+            self.database.mark_api_token_used(token_id)
+            return {
+                "token_id": token_id,
+                "owner_user_id": int(row["owner_user_id"]),
+                "scopes": str(row.get("scopes") or "").split(),
+                "name": str(row.get("name") or ""),
+            }
+
+        return None
+
+    def _api_v1_require_bearer(
+        self,
+        handler: BaseHTTPRequestHandler,
+        required_scope: str,
+    ) -> dict[str, Any] | None:
+        content_type = "application/json; charset=utf-8"
+        credential = self._api_v1_authenticate_bearer(handler)
+
+        if credential is None:
+            self._json(
+                handler, 401,
+                api_err("invalid_auth", "A valid Bearer API token is required."),
+                content_type=content_type,
+            )
+            return None
+
+        if required_scope not in credential["scopes"]:
+            self._json(
+                handler, 403,
+                api_err("insufficient_scope", f"The token requires the {required_scope} scope."),
+                content_type=content_type,
+            )
+            return None
+
+        return credential
+
+    def _api_v1_me(self, handler: BaseHTTPRequestHandler) -> None:
+        credential = self._api_v1_require_bearer(handler, "me:read")
+        if credential is None:
+            return
+
+        user = self.database.get_user(int(credential["owner_user_id"]))
+        if user is None:
+            self._json(
+                handler, 401,
+                api_err("invalid_auth", "The token owner no longer exists."),
+                content_type="application/json; charset=utf-8",
+            )
+            return
+
+        self._json(
+            handler,
+            200,
+            api_ok({
+                "user": {
+                    "id": int(user["id"]),
+                    "display_name": str(user.get("display_name") or ""),
+                },
+                "token": {
+                    "id": credential["token_id"],
+                    "name": credential["name"],
+                },
+                "scopes": credential["scopes"],
+            }),
+            content_type="application/json; charset=utf-8",
+        )
+
+    def _api_v1_list_tokens(self, handler: BaseHTTPRequestHandler) -> None:
+        credential = self._api_v1_require_bearer(handler, "tokens:read")
+        if credential is None:
+            return
+
+        tokens = self.database.list_api_tokens(int(credential["owner_user_id"]))
+        self._json(
+            handler,
+            200,
+            api_ok({"tokens": tokens}),
+            content_type="application/json; charset=utf-8",
+        )
+
+    def _api_v1_create_token(self, handler: BaseHTTPRequestHandler) -> None:
+        json_type = "application/json; charset=utf-8"
+
+        def fail(status: int, code: str, message: str) -> None:
+            self._json(handler, status, api_err(code, message), content_type=json_type)
+
+        # Token creation is cookie-authenticated only; do not allow a Bearer
+        # token alone to create more credentials.
+        if not self._cookie(handler, APP_COOKIE):
+            fail(401, "invalid_auth", "Sign in with the application session to create a token.")
+            return
+
+        identity = self._identity(handler)
+        if identity is None:
+            fail(401, "invalid_auth", "A valid application session is required.")
+            return
+
+        if not self._csrf_valid(handler, identity, {}):
+            fail(403, "invalid_csrf", "A valid X-CSRF-Token header is required.")
+            return
+
+        content_type = (handler.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            fail(400, "invalid_request", "Content-Type must be application/json.")
+            return
+
+        try:
+            length = int(handler.headers.get("Content-Length") or "0")
+        except ValueError:
+            fail(400, "invalid_request", "Invalid Content-Length.")
+            return
+
+        if length < 0:
+            fail(400, "invalid_request", "Invalid request body length.")
+            return
+        if length > 64 * 1024:
+            fail(413, "request_too_large", "Request body exceeds 64 KiB.")
+            return
+
+        raw = handler.rfile.read(length) if length else b""
+        if len(raw) != length:
+            fail(400, "invalid_request", "Incomplete request body.")
+            return
+
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            fail(400, "invalid_request", "Request body must be valid JSON.")
+            return
+
+        if not isinstance(payload, dict):
+            fail(400, "invalid_request", "Request body must be a JSON object.")
+            return
+
+        name = payload.get("name", "")
+        if not isinstance(name, str) or len(name) > 100:
+            fail(400, "invalid_request", "Token name must be a string of at most 100 characters.")
+            return
+
+        allowed_scopes = {
+            "me:read",
+            "tokens:read",
+            "tokens:write",
+            "sessions:read",
+            "sessions:write",
+            "events:read",
+            "sync:write",
+        }
+        requested_scopes = payload.get("scopes", ["me:read"])
+        if (
+            not isinstance(requested_scopes, list)
+            or any(not isinstance(scope, str) for scope in requested_scopes)
+        ):
+            fail(400, "invalid_scope", "scopes must be an array of strings.")
+            return
+
+        scopes = sorted({scope.strip() for scope in requested_scopes})
+        if any(not scope or scope not in allowed_scopes for scope in scopes):
+            fail(400, "invalid_scope", "One or more requested scopes are not supported.")
+            return
+
+        user = self.database.get_or_create_user(
+            str(identity["sub"]),
+            str(identity.get("name") or identity["sub"]),
+        )
+
+        # Show the secret exactly once. Only its SHA-256 hash is persisted.
+        secret = "phk_" + secrets.token_urlsafe(32)
+        token_id = secrets.token_urlsafe(12)
+        token_hash = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+        try:
+            record = self.database.create_api_token(
+                token_id=token_id,
+                owner_user_id=int(user["id"]),
+                token_hash=token_hash,
+                token_prefix=secret[:12],
+                scopes=scopes,
+                name=name,
+            )
+        except Exception:
+            fail(500, "internal_error", "Could not create API token.")
+            return
+
+        self._json(
+            handler,
+            201,
+            api_ok({
+                "id": record["id"],
+                "name": record["name"],
+                "token": secret,
+                "scopes": record["scopes"],
+                "created_at": record["created_at"],
+            }),
+            content_type=json_type,
+        )
+
+    def _api_v1_revoke_token(
+        self,
+        handler: BaseHTTPRequestHandler,
+        token_id: str,
+    ) -> None:
+        credential = self._api_v1_require_bearer(handler, "tokens:write")
+        if credential is None:
+            return
+
+        revoked = self.database.revoke_api_token(
+            int(credential["owner_user_id"]),
+            token_id,
+        )
+        if not revoked:
+            self._json(
+                handler, 404,
+                api_err("not_found", "API token not found."),
+                content_type="application/json; charset=utf-8",
+            )
+            return
+
+        self._json(
+            handler,
+            200,
+            api_ok({"id": token_id, "revoked": True}),
+            content_type="application/json; charset=utf-8",
+        )
 
     def _identity(self, handler: BaseHTTPRequestHandler) -> dict[str, Any] | None:
         if self.config.auth_mode == "disabled":
@@ -888,6 +1663,197 @@ class ServerApplication:
           </section>
         </main>"""
         self._html(handler, 200, self._layout("Server status" if not vi else "Trạng thái máy chủ", body), no_store=True)
+
+    def _api_v1_rate_limited(self, handler: BaseHTTPRequestHandler) -> bool:
+        address = getattr(handler, "client_address", ("unknown",))
+        remote_ip = str(address[0]) if address else "unknown"
+        now = time.monotonic()
+        cutoff = now - 60.0
+
+        with self._api_v1_rate_lock:
+            for ip in list(self._api_v1_request_times):
+                fresh = [
+                    stamp for stamp in self._api_v1_request_times[ip]
+                    if stamp > cutoff
+                ]
+                if fresh:
+                    self._api_v1_request_times[ip] = fresh
+                else:
+                    del self._api_v1_request_times[ip]
+
+            recent = self._api_v1_request_times.get(remote_ip, [])
+            if len(recent) >= 10:
+                return True
+
+            recent.append(now)
+            self._api_v1_request_times[remote_ip] = recent
+            return False
+
+    def _api_v1_one_shot(
+        self,
+        handler: BaseHTTPRequestHandler,
+        query: dict[str, list[str]],
+    ) -> None:
+        json_type = "application/json; charset=utf-8"
+
+        def fail(status: int, code: str, message: str) -> None:
+            self._json(handler, status, api_err(code, message), content_type=json_type)
+
+        if self._api_v1_rate_limited(handler):
+            fail(429, "rate_limited", "Too many requests; try again later.")
+            return
+
+        try:
+            length = int(handler.headers.get("Content-Length") or "0")
+        except ValueError:
+            fail(400, "invalid_request", "Invalid Content-Length.")
+            return
+
+        if length < 0:
+            fail(400, "invalid_request", "Invalid request body length.")
+            return
+        if length > MAX_EXPORT_FORM_BYTES:
+            fail(413, "request_too_large", "Request body exceeds 1 MiB.")
+            return
+        content_type = (handler.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            fail(400, "invalid_request", "Content-Type must be application/json.")
+            return
+
+        raw = handler.rfile.read(length) if length else b""
+        if len(raw) != length:
+            fail(400, "invalid_request", "Incomplete request body.")
+            return
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            fail(400, "invalid_request", "Request body must be valid JSON.")
+            return
+        if not isinstance(payload, dict):
+            fail(400, "invalid_request", "Request body must be a JSON object.")
+            return
+
+        format_values = query.get("format", ["json"])
+        output_format = (format_values[0] if format_values else "json").strip().lower()
+        if output_format not in {"json", "ics", "xlsx", "zip"}:
+            fail(400, "invalid_format", "Format must be json, ics, xlsx, or zip.")
+            return
+
+        try:
+            start = parse_date(payload.get("start"))
+            end = parse_date(payload.get("end"))
+            if start > end:
+                raise ValueError("start date must not be after end date")
+        except ValueError:
+            fail(400, "invalid_range", "Provide a valid start and end date.")
+            return
+
+        bootstrap_value = payload.get("bootstrapHtml")
+        user_id = payload.get("userId")
+        token = payload.get("tokenJWT")
+        has_bootstrap = isinstance(bootstrap_value, str) and bool(bootstrap_value.strip())
+        has_manual = bool(user_id) or bool(token)
+
+        if has_bootstrap == has_manual:
+            fail(400, "invalid_auth", "Provide bootstrapHtml or userId and tokenJWT.")
+            return
+
+        if has_bootstrap:
+            try:
+                session = parse_bootstrap_html(bootstrap_value)
+            except (ValueError, UnicodeError, json.JSONDecodeError):
+                fail(400, "invalid_auth", "bootstrapHtml does not contain valid session data.")
+                return
+        else:
+            if (
+                not isinstance(user_id, str) or not user_id.strip()
+                or not isinstance(token, str) or not token.strip()
+            ):
+                fail(400, "invalid_auth", "Both userId and tokenJWT are required.")
+                return
+            session = {"userId": user_id.strip(), "tokenJWT": token.strip()}
+
+        if (
+            not isinstance(session, dict)
+            or not isinstance(session.get("userId"), str)
+            or not session.get("userId", "").strip()
+            or not isinstance(session.get("tokenJWT"), str)
+            or not session.get("tokenJWT", "").strip()
+        ):
+            fail(400, "invalid_auth", "Authentication data is missing userId or tokenJWT.")
+            return
+
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                summary = self.calendar_exporter(
+                    session, start, end, directory,
+                    "calendar", "Phenikaa Learning Calendar",
+                )
+
+                summary_data = {
+                    key: summary[key]
+                    for key in ("events", "classes", "exams", "date_start", "date_end")
+                    if key in summary
+                }
+
+                if output_format == "json":
+                    events = json.loads(
+                        Path(summary["json"]).read_text(encoding="utf-8")
+                    )
+                    result_data = {"summary": summary_data, "events": events}
+                    file_body = None
+                    content_type_out = ""
+                    filename = ""
+                elif output_format == "ics":
+                    result_data = None
+                    file_body = Path(summary["ics"]).read_bytes()
+                    content_type_out = "text/calendar; charset=utf-8"
+                    filename = "phenikaa-calendar-export.ics"
+                elif output_format == "xlsx":
+                    result_data = None
+                    file_body = Path(summary["xlsx"]).read_bytes()
+                    content_type_out = (
+                        "application/vnd.openxmlformats-officedocument."
+                        "spreadsheetml.sheet"
+                    )
+                    filename = "phenikaa-calendar-export.xlsx"
+                else:
+                    output = io.BytesIO()
+                    with zipfile.ZipFile(
+                        output, "w", compression=zipfile.ZIP_DEFLATED
+                    ) as archive:
+                        for extension in ("json", "xlsx", "ics"):
+                            archive.write(
+                                summary[extension],
+                                arcname=f"calendar.{extension}",
+                            )
+                    result_data = None
+                    file_body = output.getvalue()
+                    content_type_out = "application/zip"
+                    filename = "phenikaa-calendar-export.zip"
+
+        except PermissionError:
+            fail(401, "auth_expired", "Phenikaa authentication expired; refresh your credentials.")
+            return
+        except (KeyError, OSError, RuntimeError, ValueError, TypeError):
+            fail(502, "export_failed", "Calendar export failed; check credentials and date range.")
+            return
+        except Exception:
+            fail(502, "export_failed", "Calendar export failed.")
+            return
+
+        if output_format == "json":
+            self._json(handler, 200, api_ok(result_data), content_type=json_type)
+            return
+
+        assert file_body is not None
+        handler.send_response(200)
+        handler.send_header("Content-Type", content_type_out)
+        handler.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("Content-Length", str(len(file_body)))
+        handler.end_headers()
+        handler.wfile.write(file_body)
 
     def _export(self, handler: BaseHTTPRequestHandler, form: dict[str, str]) -> None:
         try:
@@ -1448,10 +2414,10 @@ class ServerApplication:
         handler.end_headers()
         handler.wfile.write(body)
 
-    def _json(self, handler: BaseHTTPRequestHandler, status: int, value: object, *, clear_cookie: str | None = None) -> None:
+    def _json(self, handler: BaseHTTPRequestHandler, status: int, value: object, *, clear_cookie: str | None = None, content_type: str = "application/json") -> None:
         body = json.dumps(value).encode("utf-8")
         handler.send_response(status)
-        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Type", content_type)
         handler.send_header("Cache-Control", "no-store")
         self._send_clear_cookie(handler, clear_cookie)
         handler.send_header("Content-Length", str(len(body)))
