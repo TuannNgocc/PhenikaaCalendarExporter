@@ -85,6 +85,19 @@ CREATE TABLE IF NOT EXISTS google_event_links (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (session_id, calendar_id, source_key)
 );
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id TEXT PRIMARY KEY,
+    owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    token_prefix TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    scopes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    last_used_at TEXT,
+    revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_owner_created_at
+    ON api_tokens(owner_user_id, created_at);
 """
 
 GOOGLE_APP_CALENDAR_READY = "app_calendar_ready"
@@ -281,6 +294,91 @@ class Database:
     def delete_user(self, user_id: int) -> None:
         self._write("DELETE FROM users WHERE id = ?", (user_id,))
 
+    # -- API tokens ----------------------------------------------------
+
+    def create_api_token(
+        self,
+        token_id: str,
+        owner_user_id: int,
+        token_hash: str,
+        token_prefix: str,
+        scopes: list[str],
+        name: str = "",
+    ) -> dict[str, Any]:
+        normalized_scopes = sorted({
+            scope.strip() for scope in scopes if scope.strip()
+        })
+        self._write(
+            "INSERT INTO api_tokens "
+            "(id, owner_user_id, token_hash, token_prefix, name, scopes, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                token_id,
+                owner_user_id,
+                token_hash,
+                token_prefix,
+                name.strip(),
+                " ".join(normalized_scopes),
+                utc_now_iso(),
+            ),
+        )
+        row = self._fetchone(
+            "SELECT id, owner_user_id, token_prefix, name, scopes, created_at, "
+            "last_used_at, revoked_at FROM api_tokens WHERE id = ?",
+            (token_id,),
+        )
+        if row is None:
+            raise RuntimeError("failed to create API token")
+        result = dict(row)
+        result["scopes"] = result["scopes"].split()
+        return result
+
+    def get_api_token_candidates(self, token_prefix: str) -> list[dict[str, Any]]:
+        rows = self._fetchall(
+            "SELECT * FROM api_tokens "
+            "WHERE token_prefix = ? AND revoked_at IS NULL",
+            (token_prefix,),
+        )
+        return [dict(row) for row in rows]
+
+    def list_api_tokens(self, owner_user_id: int) -> list[dict[str, Any]]:
+        rows = self._fetchall(
+            "SELECT id, owner_user_id, token_prefix, name, scopes, "
+            "created_at, last_used_at, revoked_at "
+            "FROM api_tokens WHERE owner_user_id = ? "
+            "ORDER BY created_at DESC",
+            (owner_user_id,),
+        )
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["scopes"] = item["scopes"].split()
+            result.append(item)
+        return result
+
+    def mark_api_token_used(self, token_id: str) -> None:
+        self._write(
+            "UPDATE api_tokens SET last_used_at = ? "
+            "WHERE id = ? AND revoked_at IS NULL",
+            (utc_now_iso(), token_id),
+        )
+
+    def revoke_api_token(self, owner_user_id: int, token_id: str) -> bool:
+        row = self._fetchone(
+            "SELECT revoked_at FROM api_tokens "
+            "WHERE id = ? AND owner_user_id = ?",
+            (token_id, owner_user_id),
+        )
+        if row is None:
+            return False
+        if row["revoked_at"] is None:
+            self._write(
+                "UPDATE api_tokens SET revoked_at = ? "
+                "WHERE id = ? AND owner_user_id = ? AND revoked_at IS NULL",
+                (utc_now_iso(), token_id, owner_user_id),
+            )
+        return True
+
     def get_google_user_grant(self, user_id: int) -> dict[str, Any] | None:
         row = self._fetchone("SELECT * FROM google_user_grants WHERE user_id = ?", (user_id,))
         return dict(row) if row else None
@@ -379,6 +477,31 @@ class Database:
             ),
         )
 
+    def update_session_api_fields(
+        self,
+        session_id: str,
+        *,
+        label: str | None = None,
+        range_start: str | None = None,
+        range_end: str | None = None,
+        sync_interval_hours: float | None = None,
+    ) -> None:
+        current = self.get_session(session_id)
+        if current is None:
+            raise KeyError(f"no such session: {session_id}")
+        self._write(
+            "UPDATE sessions SET label = ?, range_start = ?, range_end = ?, "
+            "sync_interval_hours = ?, updated_at = ? WHERE id = ?",
+            (
+                label if label is not None else current["label"],
+                range_start if range_start is not None else current["range_start"],
+                range_end if range_end is not None else current["range_end"],
+                sync_interval_hours if sync_interval_hours is not None else current["sync_interval_hours"],
+                utc_now_iso(),
+                session_id,
+            ),
+        )
+
     def mark_synced(self, session_id: str, *, ok: bool, detail: str = "") -> None:
         status = STATUS_ACTIVE if ok else STATUS_NEEDS_HUMAN if "login" in detail.lower() else STATUS_ACTIVE
         error = None if ok else detail
@@ -418,6 +541,13 @@ class Database:
             (session_id, limit),
         )
         return [dict(row) for row in rows]
+
+    def get_sync_run(self, session_id: str, run_id: int) -> dict[str, Any] | None:
+        row = self._fetchone(
+            "SELECT * FROM sync_runs WHERE session_id = ? AND id = ?",
+            (session_id, run_id),
+        )
+        return dict(row) if row else None
 
     def upsert_google_connection(
         self,
