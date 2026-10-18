@@ -537,7 +537,7 @@ class ServerApplication:
             return
         self._error(handler, 404, "not found")
 
-        def _api_v1_error_response(
+    def _api_v1_error_response(
         self, handler: BaseHTTPRequestHandler, status: int, code: str, message: str,
         details: dict[str, Any] | None = None,
     ) -> None:
@@ -547,6 +547,7 @@ class ServerApplication:
             api_err(code, message, details),
             content_type="application/json; charset=utf-8",
         )
+
     def _api_v1_read_json_payload(
         self, handler: BaseHTTPRequestHandler, *, max_bytes: int = 64 * 1024
     ) -> dict[str, Any]:
@@ -1014,6 +1015,11 @@ class ServerApplication:
                 api_err("invalid_auth", "A valid Bearer API token is required."),
                 content_type=content_type,
             )
+            return None
+
+        wait = self._api_v1_rate_check("tok:" + str(credential["token_id"]), 60)
+        if wait:
+            self._api_v1_rate_limited_response(handler, wait)
             return None
 
         if required_scope not in credential["scopes"]:
@@ -1641,37 +1647,50 @@ class ServerApplication:
         </main>"""
         self._html(handler, 200, self._layout("Server status" if not vi else "Trạng thái máy chủ", body), no_store=True)
 
-    def _api_v1_rate_limited(self, handler: BaseHTTPRequestHandler) -> bool:
-        address = getattr(handler, "client_address", ("unknown",))
-        remote_ip = str(address[0]) if address else "unknown"
-        if remote_ip in ("127.0.0.1", "::1", "localhost"):
-            forwarded = (
-                handler.headers.get("CF-Connecting-IP")
-                or handler.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
-            )
-            if forwarded:
-                remote_ip = forwarded
+    def _api_v1_client_ip(self, handler: BaseHTTPRequestHandler) -> str:
+        peer = str(handler.client_address[0])
+        if peer in self.config.trusted_proxies:
+            direct = (handler.headers.get("CF-Connecting-IP") or "").strip()
+            if direct:
+                return direct
+            parts = [
+                part.strip()
+                for part in (handler.headers.get("X-Forwarded-For") or "").split(",")
+                if part.strip()
+            ]
+            if parts:
+                return parts[-1]  # muc do proxy tin cay noi vao; muc dau client tu dat duoc
+        return peer
+
+    def _api_v1_rate_check(self, key: str, limit: int, window: float = 60.0) -> int:
+        """Return 0 if allowed, otherwise the number of seconds to wait."""
         now = time.monotonic()
-        cutoff = now - 60.0
-
         with self._api_v1_rate_lock:
-            for ip in list(self._api_v1_request_times):
-                fresh = [
-                    stamp for stamp in self._api_v1_request_times[ip]
-                    if stamp > cutoff
-                ]
-                if fresh:
-                    self._api_v1_request_times[ip] = fresh
-                else:
-                    del self._api_v1_request_times[ip]
-
-            recent = self._api_v1_request_times.get(remote_ip, [])
-            if len(recent) >= 10:
-                return True
-
+            table = self._api_v1_request_times
+            if len(table) > 5000:
+                for stale in [k for k, v in table.items() if not v or v[-1] <= now - window]:
+                    del table[stale]
+            recent = [stamp for stamp in table.get(key, []) if stamp > now - window]
+            if len(recent) >= limit:
+                table[key] = recent
+                return max(1, math.ceil(recent[0] + window - now))
             recent.append(now)
-            self._api_v1_request_times[remote_ip] = recent
-            return False
+            table[key] = recent
+            return 0
+
+    def _api_v1_rate_limited_response(
+        self, handler: BaseHTTPRequestHandler, retry_after: int
+    ) -> None:
+        body = json.dumps(
+            api_err("rate_limited", "Too many requests; try again later.", {"retryAfter": retry_after})
+        ).encode("utf-8")
+        handler.send_response(429)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("Retry-After", str(retry_after))
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
 
     def _api_v1_one_shot(
         self,
@@ -1683,8 +1702,9 @@ class ServerApplication:
         def fail(status: int, code: str, message: str) -> None:
             self._json(handler, status, api_err(code, message), content_type=json_type)
 
-        if self._api_v1_rate_limited(handler):
-            fail(429, "rate_limited", "Too many requests; try again later.")
+        wait = self._api_v1_rate_check("ip:" + self._api_v1_client_ip(handler), 10)
+        if wait:
+            self._api_v1_rate_limited_response(handler, wait)
             return
 
         try:
