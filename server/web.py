@@ -537,16 +537,16 @@ class ServerApplication:
             return
         self._error(handler, 404, "not found")
 
-    def _api_v1_error_response(
-        self, handler: BaseHTTPRequestHandler, status: int, code: str, message: str
+        def _api_v1_error_response(
+        self, handler: BaseHTTPRequestHandler, status: int, code: str, message: str,
+        details: dict[str, Any] | None = None,
     ) -> None:
         self._json(
             handler,
             status,
-            api_err(code, message),
+            api_err(code, message, details),
             content_type="application/json; charset=utf-8",
         )
-
     def _api_v1_read_json_payload(
         self, handler: BaseHTTPRequestHandler, *, max_bytes: int = 64 * 1024
     ) -> dict[str, Any]:

@@ -9,18 +9,12 @@ def ok(data: Any) -> dict[str, Any]:
         "data": data,
     }
 
-
-def err(code: str, message: str) -> dict[str, Any]:
+def err(code: str, message: str, details: dict[str, Any] | None = None) -> dict[str, Any]:
     """Create a standard API error response."""
-    return {
-        "ok": False,
-        "error": {
-            "code": code,
-            "message": message,
-        },
-    }
-
-
+    error: dict[str, Any] = {"code": code, "message": message}
+    if details:
+        error["details"] = details
+    return {"ok": False, "error": error}
 def parse_date(value: Any) -> date:
     """Parse an API date in ISO or DD/MM/YYYY format."""
     if not isinstance(value, str):
