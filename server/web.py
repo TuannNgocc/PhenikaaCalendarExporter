@@ -4,6 +4,8 @@ import hashlib
 import html
 import io
 import json
+import uuid
+import os
 import math
 import secrets
 import shutil
@@ -20,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Protocol
 
-from phenikaa_exporter import export_calendar_files, parse_bootstrap_html
+from phenikaa_exporter import export_calendar_files, parse_bootstrap_html, write_xlsx
 from phenikaa_login import LoginTimeout
 
 from server.config import ServerConfig, academic_year_range
@@ -202,6 +204,9 @@ class ServerApplication:
                 return
             self._api_v1_error_response(handler, 404, "not_found", "API route not found.")
             return
+        if path.startswith("/api/v1"):
+            self._api_v1_error_response(handler, 404, "not_found", "API route not found.")
+            return
         if path in ("/api/status", "/status.json"):
             refresh = "refresh" in urllib.parse.parse_qs(parsed.query)
             self._json(handler, 200, self._get_system_status(refresh=refresh))
@@ -320,6 +325,9 @@ class ServerApplication:
             return
         if path == "/api/v1/export/one-shot":
             self._api_v1_one_shot(handler, urllib.parse.parse_qs(parsed.query))
+            return
+        if path.startswith("/api/v1"):
+            self._api_v1_error_response(handler, 404, "not_found", "API route not found.")
             return
         identity = self._identity(handler)
         if identity is None and path != "/export":
@@ -757,6 +765,14 @@ class ServerApplication:
         if session is None:
             return
 
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(handler.path).query)
+        calendar_action = (query.get("calendar") or ["keep"])[0]
+        if calendar_action not in ("keep", "hide", "delete"):
+            self._api_v1_error_response(
+                handler, 400, "invalid_request", "calendar must be keep, hide, or delete."
+            )
+            return
+
         self.broker.forget_attempt(session_id)
         self.database.update_session_status(session_id, STATUS_DISABLED)
         lock = self._acquire_profile_lock(session_id)
@@ -766,7 +782,8 @@ class ServerApplication:
         warnings: list[str] = []
         try:
             if self.google is not None:
-                self._remove_account_calendar(session_id, "delete", warnings)
+                if calendar_action != "keep":
+                    self._remove_account_calendar(session_id, calendar_action, warnings)
                 if self.database.get_google_connection(session_id) is not None:
                     self.google.disconnect(session_id)
             self.broker.delete_profile(session_id)
@@ -840,6 +857,8 @@ class ServerApplication:
         exports = []
         for extension in ("json", "ics", "xlsx"):
             file_path = root / f"calendar.{extension}"
+            if extension == "xlsx" and (root / "calendar.json").is_file():
+                file_path = self._api_v1_ensure_xlsx(session_id) or file_path
             if file_path.is_file():
                 stat = file_path.stat()
                 exports.append({
@@ -851,6 +870,27 @@ class ServerApplication:
             handler, 200, api_ok({"exports": exports}),
             content_type="application/json; charset=utf-8",
         )
+
+    def _api_v1_ensure_xlsx(self, session_id: str) -> Path | None:
+        base = self.config.exports_dir / session_id
+        source, target = base / "calendar.json", base / "calendar.xlsx"
+        if not source.is_file():
+            return None
+        if target.is_file() and target.stat().st_mtime_ns >= source.stat().st_mtime_ns:
+            return target
+        try:
+            events = json.loads(source.read_text(encoding="utf-8"))
+            if not isinstance(events, list) or not events:
+                return None
+            temporary = base / f"calendar.{uuid.uuid4().hex}.tmp.xlsx"
+            try:
+                write_xlsx(temporary, events)
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            return None
+        return target
 
     def _api_v1_download_export(
         self, handler: BaseHTTPRequestHandler, session_id: str, filename: str
@@ -869,8 +909,11 @@ class ServerApplication:
         if content_type is None:
             self._api_v1_error_response(handler, 404, "not_found", "Export not found.")
             return
-        file_path = self.config.exports_dir / session_id / filename
-        if not file_path.is_file():
+        if filename == "calendar.xlsx":
+            file_path = self._api_v1_ensure_xlsx(session_id)
+        else:
+            file_path = self.config.exports_dir / session_id / filename
+        if file_path is None or not file_path.is_file():
             self._api_v1_error_response(handler, 404, "not_found", "Export is not available.")
             return
         body = file_path.read_bytes()
