@@ -12,7 +12,7 @@ import threading
 import time
 import urllib.parse
 import zipfile
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from email.parser import BytesParser
 from email.policy import default
 from http import cookies
@@ -52,6 +52,7 @@ STATUS_LABELS = {
     "disabled": "Disabled",
          }
 MAX_EXPORT_FORM_BYTES = 1024 * 1024
+API_SYNC_COOLDOWN_SECONDS = 60
 
 
 class GoogleCalendarWebService(Protocol):
@@ -66,7 +67,7 @@ class GoogleCalendarWebService(Protocol):
 
 
 class SyncRequester(Protocol):
-    def request_sync(self, session_id: str) -> None:
+    def request_sync(self, session_id: str, *, run_id: int | None = None) -> None:
         pass
 
 
@@ -899,22 +900,45 @@ class ServerApplication:
         credential = self._api_v1_require_bearer(handler, "sync:write")
         if credential is None:
             return
-        if self._api_v1_owned_session(handler, credential, session_id) is None:
+        session = self._api_v1_owned_session(handler, credential, session_id)
+        if session is None:
             return
-        before = {item["id"] for item in self.database.last_sync_runs(session_id, limit=20)}
+        if session.get("status") == STATUS_DISABLED:
+            self._api_v1_error_response(handler, 409, "session_disabled", "Session is disabled.")
+            return
+        if not session.get("token_encrypted") or not session.get("phenikaa_user_id"):
+            self._api_v1_error_response(
+                handler, 409, "login_required",
+                "Sign in to Phenikaa in the web app before syncing.",
+            )
+            return
+        last = self.database.last_sync_runs(session_id, limit=1)
+        if last and last[0].get("finished_at"):
+            try:
+                finished = datetime.fromisoformat(str(last[0]["finished_at"]))
+                waited = (datetime.now(timezone.utc) - finished).total_seconds()
+            except ValueError:
+                waited = API_SYNC_COOLDOWN_SECONDS
+            if waited < API_SYNC_COOLDOWN_SECONDS:
+                self._api_v1_rate_limited_response(
+                    handler, math.ceil(API_SYNC_COOLDOWN_SECONDS - waited)
+                )
+                return
+        run_id, running = self.database.start_sync_run_if_idle(session_id)
+        if running is not None:
+            self._api_v1_error_response(
+                handler, 409, "conflict_running", "A sync is already running.",
+                {"runId": running["id"]},
+            )
+            return
         try:
-            self.sync_engine.request_sync(session_id)
+            self.sync_engine.request_sync(session_id, run_id=run_id)
         except Exception:
-            self._api_v1_error_response(handler, 409, "conflict_running", "Sync could not be queued.")
+            self.database.finish_sync_run(run_id, ok=False, detail="could not queue sync")
+            self._api_v1_error_response(handler, 503, "sync_unavailable", "Sync could not be queued.")
             return
-        runs = self.database.last_sync_runs(session_id, limit=20)
-        created = next((item for item in runs if item["id"] not in before), None)
         self._json(
-            handler, 202,
-            api_ok({
-                "runId": created["id"] if created else None,
-                "status": self._api_v1_run_summary(created)["status"] if created else "queued",
-            }),
+            handler, 202, api_ok({"runId": run_id, "status": "running"}),
             content_type="application/json; charset=utf-8",
         )
 
