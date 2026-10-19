@@ -383,11 +383,14 @@ def openapi_document() -> dict[str, Any]:
             "/api/v1/sessions/{sessionId}/sync": {
                 "post": {
                     "tags": ["Sync"],
-                    "summary": "Request a session sync",
+                    "summary": "Queue a session sync",
+                    "description": "Queues a background sync and returns its run id; poll the run endpoint for the result. Requires the owner to have signed in to Phenikaa in the web app. Runs once at a time per session and at least 60 seconds apart.",
                     "parameters": [session_id],
                     "responses": {
-                        "202": {"description": "Sync request accepted"},
-                        "409": {"description": "Sync could not be queued"},
+                        "202": {"description": "Sync queued; data.runId and data.status are returned"},
+                        "409": {"description": "login_required, session_disabled, or conflict_running (error.details.runId is the running sync)"},
+                        "429": {"description": "The previous run finished less than 60 seconds ago; see the Retry-After header"},
+                        "503": {"description": "Sync could not be queued"},
                     },
                 }
             },
