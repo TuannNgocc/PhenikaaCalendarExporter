@@ -337,7 +337,18 @@ def openapi_document() -> dict[str, Any]:
                 "delete": {
                     "tags": ["Sessions"],
                     "summary": "Delete a session and clean up related resources",
-                    "responses": json_response,
+                    "description": "Disables the session, removes its browser profile and exports, then deletes it. The owner's Google calendar is kept unless calendar=hide or calendar=delete is given.",
+                    "parameters": [
+                        session_id,
+                        {"name": "calendar", "in": "query", "required": False,
+                         "description": "What to do with the owner's Google calendar.",
+                         "schema": {"type": "string", "enum": ["keep", "hide", "delete"], "default": "keep"}},
+                    ],
+                    "responses": {
+                        **json_response,
+                        "400": {"description": "invalid_request: calendar must be keep, hide, or delete"},
+                        "409": {"description": "conflict_running: a sync or sign-in is using the session; retry shortly"},
+                    },
                 },
             },
             "/api/v1/sessions/{sessionId}/events": {

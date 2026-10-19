@@ -21,6 +21,15 @@ class ApiDocsTests(unittest.TestCase):
         for status in ("202", "409", "429", "503"):
             self.assertIn(status, responses)
 
+    def test_delete_documents_the_calendar_option(self):
+        operation = openapi_document()["paths"]["/api/v1/sessions/{sessionId}"]["delete"]
+        parameters = {item["name"]: item for item in operation["parameters"]}
+        self.assertEqual(set(parameters), {"sessionId", "calendar"})
+        self.assertEqual(parameters["calendar"]["schema"]["enum"], ["keep", "hide", "delete"])
+        self.assertEqual(parameters["calendar"]["schema"]["default"], "keep")
+        for status in ("400", "409"):
+            self.assertIn(status, operation["responses"])
+
     def test_public_api_guide_mentions_the_key_behaviour(self):
         guide = (DOCS / "PUBLIC_API.md").read_text(encoding="utf-8")
         for phrase in ("conflict_running", "Retry-After", "calendar=keep", "PHENIKAA_SERVER_TRUSTED_PROXIES"):

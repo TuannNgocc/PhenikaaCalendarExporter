@@ -660,6 +660,32 @@
           "Sessions"
         ],
         "summary": "Delete a session and clean up related resources",
+        "description": "Disables the session, removes its browser profile and exports, then deletes it. The owner's Google calendar is kept unless calendar=hide or calendar=delete is given.",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "calendar",
+            "in": "query",
+            "required": false,
+            "description": "What to do with the owner's Google calendar.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "keep",
+                "hide",
+                "delete"
+              ],
+              "default": "keep"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful JSON response",
@@ -672,7 +698,7 @@
             }
           },
           "400": {
-            "description": "Invalid request"
+            "description": "invalid_request: calendar must be keep, hide, or delete"
           },
           "401": {
             "description": "Authentication required"
@@ -685,6 +711,9 @@
           },
           "429": {
             "description": "Rate limit exceeded"
+          },
+          "409": {
+            "description": "conflict_running: a sync or sign-in is using the session; retry shortly"
           }
         }
       }
