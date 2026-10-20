@@ -90,6 +90,16 @@ class SyncHandlerTests(unittest.TestCase):
         self.call()
         self.assertEqual(len(self.queued), 2)
 
+    def test_cooldown_tolerates_naive_timestamps(self):
+        self.login()
+        self.call()
+        run_id = self.sent[0][1]["data"]["runId"]
+        self.db.finish_sync_run(run_id, ok=True, events=1)
+        self.db._write("UPDATE sync_runs SET finished_at = ? WHERE id = ?",
+                       ("2000-01-01T00:00:00", run_id))
+        self.call()
+        self.assertEqual(len(self.queued), 2)
+
 
 class DeleteHandlerTests(unittest.TestCase):
     def setUp(self):

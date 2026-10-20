@@ -959,8 +959,10 @@ class ServerApplication:
         if last and last[0].get("finished_at"):
             try:
                 finished = datetime.fromisoformat(str(last[0]["finished_at"]))
+                if finished.tzinfo is None:
+                    finished = finished.replace(tzinfo=timezone.utc)
                 waited = (datetime.now(timezone.utc) - finished).total_seconds()
-            except ValueError:
+            except (ValueError, TypeError):
                 waited = API_SYNC_COOLDOWN_SECONDS
             if waited < API_SYNC_COOLDOWN_SECONDS:
                 self._api_v1_rate_limited_response(
